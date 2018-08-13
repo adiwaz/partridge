@@ -3,7 +3,7 @@ import datetime
 
 from partridge.config import default_config, reroot_graph
 from partridge.gtfs import feed as mkfeed, raw_feed
-from partridge.parsers import vparse_date
+from partridge.parsers import vparse_date, vparse_time, parse_time
 from partridge.utilities import remove_node_attributes
 
 
@@ -68,6 +68,14 @@ def read_trip_counts_by_date(path):
     '''A useful proxy for busyness'''
     feed = raw_feed(path)
     return _trip_counts_by_date(feed)
+
+
+def read_trip_ids_by_day(path, cutoff_time):
+    '''Find all trip identifiers by day.
+    A day is the time between 'date' at cutoff time and 'date'+1
+    at cutoff time'''
+    feed = raw_feed(path)
+    return _trip_ids_by_day(feed, cutoff_time)
 
 
 '''Private'''
@@ -149,3 +157,76 @@ def _trip_counts_by_date(feed):
         for date in dates:
             results[date] += trip_count
     return dict(results)
+
+
+def _keep_first_stop(stop_times):
+    """
+    Filter 'stop_times' to keep only the first stop for every trip identifier.
+    :param stop_times: standard GTFS stop_times table.
+    Must contain the columns: 'trip_id', 'stop_sequence', 'arrival_time'.
+    :type stop_times: pd.DataFrame
+    """
+    min_stop = stop_times.groupby('trip_id').stop_sequence.min()
+    min_stop_df = min_stop.to_frame().reset_index(drop=False)
+
+    stop_times_f = min_stop_df.merge(stop_times,
+                                     on=['trip_id', 'stop_sequence'],
+                                     how='inner')
+    return stop_times_f
+
+
+def _trip_ids_by_day(feed, cutoff_time):
+    """
+    Find all trip identifiers by day, when a day unit is the time between
+    'date' at cutoff time and 'date'+1 at cutoff time.
+    For example, the key 02-02-2018 with cutoff 16:00 will map to all trip
+    identifiers of trips that start between 02-02-2018 16:00
+    and 03-02-2018 15:59:59.
+
+    :param feed: ptg.feed object
+    :param cutoff_time: HH:MM:SS time string indicating custom day start and
+    end time
+    """
+    cutoff = parse_time(cutoff_time)
+
+    # Get all trip ids with their start time:
+    stop_times = feed.stop_times[['trip_id', 'stop_sequence', 'arrival_time']]
+    stop_times_f = _keep_first_stop(stop_times)
+    stop_times_f.arrival_time = vparse_time(stop_times_f.arrival_time)
+    stop_times_f = stop_times_f.set_index('trip_id')
+    # stop_times_f will be a df with trip_id as index,
+    # and arrival time for the first stop
+    stop_times_f = stop_times_f[['arrival_time']]
+
+    # Decide for every trip_id if it starts before or after the time cutoff
+    before_cutoff = (stop_times_f.arrival_time < cutoff)
+
+    # Combine dates availability information by service_id
+    service_ids_by_date = _service_ids_by_date(feed)
+    trips = feed.trips[['service_id', 'trip_id']]
+    # for every date, get all relevant trips before and after cutoff:
+    tid_by_cutoff = defaultdict(set)
+    for date in service_ids_by_date.keys():
+        date_service_ids = service_ids_by_date[date]
+        for sid in date_service_ids:
+            relevant_trip_ids = trips.loc[trips.service_id == sid,
+                                          'trip_id'].values
+
+            # All trip ids of this service that start before cutoff:
+            tid_before = before_cutoff.loc[relevant_trip_ids]
+            tid_by_cutoff[(date, 'before')].update(tid_before[tid_before]
+                                                   .index.values)
+
+            # All trip ids of this service that start after cutoff:
+            tid_after = ~tid_before
+            tid_by_cutoff[(date, 'after')].update(tid_after[tid_after]
+                                                  .index.values)
+
+    # for every 'date', merge (date, after) with (date+1, before):
+    tid_by_day = defaultdict(set)
+    for date in service_ids_by_date.keys():
+        next_date = date+datetime.timedelta(days=1)
+        tid_by_day[date] = tid_by_cutoff[(date, 'after')]\
+            .union(tid_by_cutoff[next_date, 'before'])
+
+    return tid_by_day
